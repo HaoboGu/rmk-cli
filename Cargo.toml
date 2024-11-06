@@ -1,0 +1,14 @@
+[package]
+name = "rmk-cli"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+
+
+[dependencies]
+clap = { version = "4.5.18", git = "https://github.com/clap-rs/clap", tag = "v4.5.20", features = ["derive", "string"] }
+rmk-config = { version = "0.2.0", features = ["toml"] }
+toml = "0.8"
+serde = "1.0"
+
