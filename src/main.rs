@@ -16,10 +16,10 @@ mod chip;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = args::Args::parse();
 
-    let keyboard_toml_config = read_keyboard_toml_config().unwrap();
+    let keyboard_toml_config = read_keyboard_toml_config()?;
 
     let project_name = keyboard_toml_config.keyboard.name.replace(" ", "_");
-    let project_dir = env::current_dir().unwrap().join(&project_name);
+    let project_dir = env::current_dir()?.join(&project_name);
     if let Err(e) = fs::create_dir_all(&project_dir) {
         eprintln!("Failed to create project directory {}: {}", project_name, e);
         process::exit(1);
@@ -203,7 +203,7 @@ where
 
     if !folder_found {
         return Err(format!(
-            "The specified folder '{}' does not exist in the archive",
+            "The specified chip/board '{}' does not exist in the template",
             folder
         )
         .into());
