@@ -1,3 +1,4 @@
+use chip::get_board_chip_map;
 use clap::Parser;
 use futures::stream::StreamExt;
 use reqwest::Client;
@@ -9,6 +10,7 @@ use std::{env, process};
 use zip::ZipArchive;
 
 mod args;
+mod chip;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,19 +25,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(1);
     }
 
-    // The following information is needed:
-    // chip or board type
-    // matrix type: normal or split?
-    // USB or BLE
-    // If nRF52840 -> S140 bootloader version?
+    // Check keyboard.toml
+    let chip = match (
+        keyboard_toml_config.keyboard.board.as_deref(),
+        keyboard_toml_config.keyboard.chip.as_deref(),
+    ) {
+        (None, None) => {
+            Err("Either 'board' or 'chip' must be specified in keyboard.toml".to_string())
+        }
+        (Some(board), None) => {
+            let map = get_board_chip_map();
+            map.get(board)
+                .map(|chip| chip.to_string())
+                .ok_or_else(|| format!("Unsupported board '{}'", board))
+        }
+        (None, Some(chip)) => Ok(chip.to_string()),
+        (Some(_), Some(_)) => {
+            Err("'board' and 'chip' cannot both be specified in keyboard.toml".to_string())
+        }
+    }?;
 
-    // TODO: download the corresponding project template to `project_dir`
+    let matrix_type = match (keyboard_toml_config.matrix, keyboard_toml_config.split) {
+        (None, None) => {
+            Err("Either 'matrix' or 'split' section must be specified in keyboard.toml".to_string())
+        }
+        (None, Some(_)) => Ok("split".to_string()),
+        (Some(_), None) => Ok("normal".to_string()),
+        (Some(_), Some(_)) => {
+            Err("'matrix' and 'split' cannot both be specified in keyboard.toml".to_string())
+        }
+    }?;
+
+    let folder = if matrix_type == "split" {
+        format!("{}_{}", chip, matrix_type)
+    } else {
+        chip
+    };
 
     // TODO: Replace with actual GitHub repository information
     let user = "HaoboGu";
     let repo = "rmk-template";
     let branch = "feat/rework";
-    let folder = "nrf52840";
 
     let url = format!(
         "https://github.com/{}/{}/archive/refs/heads/{}.zip",
@@ -43,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Download project template
-    download_with_progress(&url, &project_dir, folder).await?;
+    download_with_progress(&url, &project_dir, &folder).await?;
 
     // Copy keyboard.toml and vial.json to project_dir
     if let Err(e) = fs::copy(&args.keyboard_toml_path, project_dir.join("keyboard.toml")) {
@@ -102,7 +132,7 @@ where
     }
     fs::create_dir_all(output_path)?;
 
-    println!("Download project template...");
+    println!("Download project template for {}...", folder);
 
     // Send request and get response
     let client = Client::new();
@@ -142,8 +172,6 @@ where
         let chunk = chunk?;
         temp_file.write_all(&chunk)?;
     }
-
-    println!("Download complete...");
 
     // Open the downloaded ZIP file and extract
     let zip_file = File::open(&temp_file_path)?;
