@@ -3,6 +3,8 @@ name = "rmk-cli"
 version = "0.1.0"
 edition = "2021"
 resolver = "2"
+description = "RMK CLI is a tool that parses `keybaord.toml` and `vial.json`, generates RMK project."
+license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5.18", git = "https://github.com/clap-rs/clap", tag = "v4.5.20", features = [
