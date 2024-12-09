@@ -1,113 +1,135 @@
-use chip::get_board_chip_map;
+use chip::get_chip_options;
 use clap::Parser;
 use futures::stream::StreamExt;
+use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
+use inquire::{Select, Text};
+use keyboard_toml::{parse_keyboard_toml, ProjectInfo};
 use reqwest::Client;
-use rmk_config::toml_config::KeyboardTomlConfig;
-use std::fs::{self, File};
+use std::error::Error;
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::{env, process};
+use std::{fs, process};
 use zip::ZipArchive;
 
 mod args;
 mod chip;
+mod keyboard_toml;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
+    inquire::set_global_render_config(get_render_config());
     let args = args::Args::parse();
 
-    let keyboard_toml_config = read_keyboard_toml_config()?;
-
-    let project_name = keyboard_toml_config.keyboard.name.replace(" ", "_");
-    let project_dir = env::current_dir()?.join(&project_name);
-    if let Err(e) = fs::create_dir_all(&project_dir) {
-        eprintln!("Failed to create project directory {}: {}", project_name, e);
-        process::exit(1);
+    match args.command {
+        args::Commands::Create {
+            keyboard_toml_path,
+            vial_json_path,
+        } => create_project(keyboard_toml_path, vial_json_path).await,
+        args::Commands::Init {
+            project_name,
+            chip,
+            split,
+        } => init_project(project_name, chip, split).await,
     }
+}
 
-    // Check keyboard.toml
-    let chip = match (
-        keyboard_toml_config.keyboard.board.as_deref(),
-        keyboard_toml_config.keyboard.chip.as_deref(),
-    ) {
-        (None, None) => {
-            Err("Either 'board' or 'chip' must be specified in keyboard.toml".to_string())
-        }
-        (Some(board), None) => {
-            let map = get_board_chip_map();
-            map.get(board)
-                .map(|chip| chip.to_string())
-                .ok_or_else(|| format!("Unsupported board '{}'", board))
-        }
-        (None, Some(chip)) => Ok(chip.to_string()),
-        (Some(_), Some(_)) => {
-            Err("'board' and 'chip' cannot both be specified in keyboard.toml".to_string())
-        }
-    }?;
+async fn create_project(
+    mut keyboard_toml_path: String,
+    mut vial_json_path: String,
+) -> Result<(), Box<dyn Error>> {
+    // Inquire paths interactively is no argument is specified
+    if keyboard_toml_path.is_empty() {
+        keyboard_toml_path = Text::new("Path to keyboard.toml:")
+            .with_default("./keyboard.toml")
+            .prompt()?;
+    }
+    if vial_json_path.is_empty() {
+        vial_json_path = Text::new("Path to vial.json")
+            .with_default(&"./vial.json")
+            .prompt()?
+    }
+    // Parse keyboard.toml to get project info
+    let project_info = parse_keyboard_toml(&keyboard_toml_path)?;
 
-    let matrix_type = match (keyboard_toml_config.matrix, keyboard_toml_config.split) {
-        (None, None) => {
-            Err("Either 'matrix' or 'split' section must be specified in keyboard.toml".to_string())
-        }
-        (None, Some(_)) => Ok("split".to_string()),
-        (Some(_), None) => Ok("normal".to_string()),
-        (Some(_), Some(_)) => {
-            Err("'matrix' and 'split' cannot both be specified in keyboard.toml".to_string())
-        }
-    }?;
-
-    let folder = if matrix_type == "split" {
-        format!("{}_{}", chip, matrix_type)
-    } else {
-        chip
-    };
-
-    // TODO: Replace with actual GitHub repository information
-    let user = "HaoboGu";
-    let repo = "rmk-template";
-    let branch = "feat/rework";
-
-    let url = format!(
-        "https://github.com/{}/{}/archive/refs/heads/{}.zip",
-        user, repo, branch
-    );
-
-    // Download project template
-    download_with_progress(&url, &project_dir, &folder).await?;
+    // Download corresponding project template
+    download_project_template(&project_info).await?;
 
     // Copy keyboard.toml and vial.json to project_dir
-    if let Err(e) = fs::copy(&args.keyboard_toml_path, project_dir.join("keyboard.toml")) {
-        eprintln!("Failed to copy keyboard.toml to project directory: {}", e);
-        process::exit(1);
-    }
+    fs::copy(
+        &keyboard_toml_path,
+        project_info.target_dir.join("keyboard.toml"),
+    )?;
+    fs::copy(&vial_json_path, project_info.target_dir.join("vial.json"))?;
 
-    if let Err(e) = fs::copy(&args.vial_json_path, project_dir.join("vial.json")) {
-        eprintln!("Failed to copy vial.json to project directory: {}", e);
-        process::exit(1);
-    }
+    // Post-process
+    post_process(project_info)?;
 
     Ok(())
 }
 
-/// Read the `keyboard.toml` configuration file
-pub(crate) fn read_keyboard_toml_config() -> Result<KeyboardTomlConfig, String> {
-    // Read the keyboard configuration file in the project root
-    let s = match fs::read_to_string("keyboard.toml") {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("Failed to read `keyboard.toml` configuration file: {}", e);
-            return Err(msg);
-        }
+fn post_process(project_info: ProjectInfo) -> Result<(), Box<dyn Error>> {
+    println!("Replacing project name placeholders...");
+    let walker = walkdir::WalkDir::new(&project_info.target_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "toml"));
+    Ok(for entry in walker {
+        let path = entry.path();
+        let content = fs::read_to_string(path)?;
+        let new_content = content.replace("{{ project_name }}", &project_info.project_name);
+        fs::write(path, new_content)?;
+    })
+}
+
+async fn download_project_template(project_info: &ProjectInfo) -> Result<(), Box<dyn Error>> {
+    let user = "HaoboGu";
+    let repo = "rmk-template";
+    let branch = "feat/rework";
+    let url = format!(
+        "https://github.com/{}/{}/archive/refs/heads/{}.zip",
+        user, repo, branch
+    );
+    download_with_progress(&url, &project_info.target_dir, &project_info.remote_folder).await
+}
+
+async fn init_project(
+    mut project_name: String,
+    mut chip: String,
+    split: bool,
+) -> Result<(), Box<dyn Error>> {
+    if project_name.is_empty() {
+        project_name = Text::new("Project Name:").prompt()?;
+    }
+    if chip.is_empty() {
+        chip = Select::new("Choose your microcontroller", get_chip_options())
+            .prompt()?
+            .to_string();
+    }
+    // Get project info from parameters
+    let target_dir = PathBuf::from(&project_name);
+    if let Err(e) = fs::create_dir_all(&target_dir) {
+        eprintln!("Failed to create project directory {}: {}", project_name, e);
+        process::exit(1);
+    }
+    let remote_folder = if split {
+        format!("{}_{}", chip, "split")
+    } else {
+        chip.clone()
+    };
+    let project_info = ProjectInfo {
+        project_name,
+        target_dir,
+        remote_folder,
     };
 
-    // Parse the configuration file content into a `KeyboardTomlConfig` struct
-    match toml::from_str(&s) {
-        Ok(c) => Ok(c),
-        Err(e) => {
-            let msg = format!("Failed to parse `keyboard.toml`: {}", e.message());
-            return Err(msg);
-        }
-    }
+    // Download template
+    download_project_template(&project_info).await?;
+
+    // Post-process
+    post_process(project_info)?;
+
+    Ok(())
 }
 
 /// Download code from a GitHub repository link and extract it to the `repo` folder, using asynchronous download and a progress bar
@@ -120,7 +142,7 @@ async fn download_with_progress<P>(
     download_url: &str,
     output_path: P,
     folder: &str,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<(), Box<dyn Error>>
 where
     P: AsRef<Path>,
 {
@@ -211,4 +233,18 @@ where
 
     println!("Project created, path: {}", output_path.display());
     Ok(())
+}
+fn get_render_config() -> RenderConfig<'static> {
+    let mut render_config = RenderConfig::default();
+    render_config.prompt_prefix = Styled::new("?").with_fg(Color::LightRed);
+
+    render_config.error_message = render_config
+        .error_message
+        .with_prefix(Styled::new("❌").with_fg(Color::LightRed));
+
+    render_config.answer = StyleSheet::new()
+        .with_attr(Attributes::ITALIC)
+        .with_fg(Color::LightGreen);
+
+    render_config
 }
